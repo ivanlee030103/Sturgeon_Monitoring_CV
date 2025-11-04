@@ -4,17 +4,18 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Sequence
 
 import cv2
 from .config import DetectorConfig, MovementConfig, TrackerConfig
 from .detection import BoundingBox, SturgeonDetector
+from .heatmap import HeatmapIntervalSaver, IntervalHeatmapConfig, LiveHeatmap, LiveHeatmapConfig
 from .movement import MovementAnalyzer
 from .tracking import CentroidTracker
 from .visualization import draw_tracks
 
 
-def parse_args(args: Iterable[str] | None = None) -> argparse.Namespace:
+def parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video", type=Path, help="Path to the input video file.")
     parser.add_argument(
@@ -51,11 +52,34 @@ def parse_args(args: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Display the annotated frames in a window while processing (press q to quit).",
     )
+    parser.add_argument(
+        "--display-heatmap",
+        action="store_true",
+        help="Display the live heatmap window while processing.",
+    )
+    parser.add_argument(
+        "--overlay-heatmap",
+        action="store_true",
+        help="Blend the live heatmap onto the annotated video feed.",
+    )
+    parser.add_argument(
+        "--heatmap-overlay-alpha",
+        type=float,
+        default=0.5,
+        help="Alpha blending factor for the heatmap overlay (0 disables overlay).",
+    )
+    parser.add_argument(
+        "--heatmap-interval-minutes",
+        type=float,
+        default=15.0,
+        help="Duration in minutes for aggregating heatmap and scatter plot exports (<=0 disables).",
+    )
     return parser.parse_args(args=args)
 
 
 def main(cli_args: Iterable[str] | None = None) -> None:
-    args = parse_args(cli_args)
+    parsed_cli_args: Sequence[str] | None = list(cli_args) if cli_args is not None else None
+    args = parse_args(parsed_cli_args)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,10 +108,23 @@ def main(cli_args: Iterable[str] | None = None) -> None:
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     movement = MovementAnalyzer(movement_config, fps=fps)
+    overlay_alpha = max(0.0, min(1.0, args.heatmap_overlay_alpha))
+    live_heatmap = LiveHeatmap(width, height, LiveHeatmapConfig(overlay_alpha=overlay_alpha))
+    interval_saver = None
+    if args.heatmap_interval_minutes and args.heatmap_interval_minutes > 0:
+        interval_config = IntervalHeatmapConfig(interval_seconds=args.heatmap_interval_minutes * 60.0)
+        interval_saver = HeatmapIntervalSaver(
+            width=width,
+            height=height,
+            fps=fps,
+            video_stem=video_path.stem,
+            output_dir=output_dir,
+            config=interval_config,
+        )
 
     writer = None
     if args.save_video:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter.fourcc(*"mp4v")
         video_out = output_dir / f"{video_path.stem}_annotated.mp4"
         writer = cv2.VideoWriter(str(video_out), fourcc, fps, (width, height))
 
@@ -104,12 +141,44 @@ def main(cli_args: Iterable[str] | None = None) -> None:
             movement.update(tracks)
 
             draw_tracks(frame, tracks)
+            live_heatmap.update(tracks)
+            if interval_saver is not None:
+                interval_saver.observe(tracks, frame_index)
+
+            heatmap_frame = None
+            if args.overlay_heatmap or args.display_heatmap:
+                heatmap_frame = live_heatmap.render()
 
             if writer is not None:
-                writer.write(frame)
+                if args.overlay_heatmap and heatmap_frame is not None:
+                    blended = cv2.addWeighted(
+                        heatmap_frame,
+                        overlay_alpha,
+                        frame,
+                        1.0 - overlay_alpha,
+                        0.0,
+                    )
+                    writer.write(blended)
+                else:
+                    writer.write(frame)
+
+            display_frame = frame
+            if args.overlay_heatmap and heatmap_frame is not None:
+                display_frame = cv2.addWeighted(
+                    heatmap_frame,
+                    overlay_alpha,
+                    frame,
+                    1.0 - overlay_alpha,
+                    0.0,
+                )
 
             if args.display:
-                cv2.imshow("Sturgeon Monitoring", frame)
+                cv2.imshow("Sturgeon Monitoring", display_frame)
+
+            if args.display_heatmap and heatmap_frame is not None:
+                cv2.imshow("Sturgeon Heatmap", heatmap_frame)
+
+            if args.display or args.display_heatmap:
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -118,8 +187,11 @@ def main(cli_args: Iterable[str] | None = None) -> None:
         capture.release()
         if writer is not None:
             writer.release()
-        if args.display:
+        if args.display or args.display_heatmap:
             cv2.destroyAllWindows()
+
+    if interval_saver is not None:
+        interval_saver.finalize()
 
     _save_results(movement, output_dir)
 

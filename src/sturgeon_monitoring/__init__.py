@@ -2,6 +2,7 @@
 
 from .config import DetectorConfig, MovementConfig, TrackerConfig
 from .detection import BoundingBox, SturgeonDetector
+from .heatmap import HeatmapIntervalSaver, IntervalHeatmapConfig, LiveHeatmap, LiveHeatmapConfig
 from .movement import MovementAnalyzer, TrackSummary
 from .tracking import CentroidTracker, Track
 
@@ -15,5 +16,9 @@ __all__ = [
     "TrackSummary",
     "CentroidTracker",
     "Track",
+    "LiveHeatmap",
+    "LiveHeatmapConfig",
+    "HeatmapIntervalSaver",
+    "IntervalHeatmapConfig",
 ]
 
