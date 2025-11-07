@@ -28,6 +28,18 @@ FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 TRACK_COLOR = (0, 255, 255)
 ROI_COLOR = (255, 140, 0)
+DEFAULT_HEATMAP_DECAY = 0.85
+MIN_HEATMAP_DECAY = 0.5
+MAX_HEATMAP_DECAY = 0.99
+DEFAULT_HEATMAP_GAIN = 0.8
+MIN_HEATMAP_GAIN = 0.1
+MAX_HEATMAP_GAIN = 3.0
+DEFAULT_HEATMAP_RADIUS = 35
+MIN_HEATMAP_RADIUS = 5
+MAX_HEATMAP_RADIUS = 120
+DEFAULT_HEATMAP_BLUR = 15
+MIN_HEATMAP_BLUR = 0
+MAX_HEATMAP_BLUR = 51
 FPS_SMOOTHING = 0.9
 DEFAULT_CONF_THRESHOLD = 0.5
 MIN_CONF_THRESHOLD = 0.1
@@ -51,6 +63,11 @@ class FishTracker:
 			self._new_history
 		)
 		self._roi = DEFAULT_ROI
+		self._heatmap: np.ndarray | None = None
+		self._heatmap_decay = DEFAULT_HEATMAP_DECAY
+		self._heatmap_gain = DEFAULT_HEATMAP_GAIN
+		self._heatmap_radius = DEFAULT_HEATMAP_RADIUS
+		self._heatmap_blur = DEFAULT_HEATMAP_BLUR
 
 	def _new_history(self) -> Deque[Tuple[int, int]]:
 		return deque(maxlen=self._trail_length)
@@ -73,6 +90,7 @@ class FishTracker:
 
 	def reset(self) -> None:
 		self._track_history = defaultdict(self._new_history)
+		self._heatmap = None
 		model = self._load_model()
 		reset_fn = getattr(model, "reset_tracker", None)
 		if callable(reset_fn):
@@ -112,12 +130,29 @@ class FishTracker:
 		y1, y2 = sorted((y1, y2))
 		self._roi = (x1, y1, x2, y2)
 
+	def set_heatmap_params(
+		self,
+		*,
+		decay: float,
+		gain: float,
+		radius: int,
+		blur: int,
+	) -> None:
+		self._heatmap_decay = max(MIN_HEATMAP_DECAY, min(decay, MAX_HEATMAP_DECAY))
+		self._heatmap_gain = max(MIN_HEATMAP_GAIN, min(gain, MAX_HEATMAP_GAIN))
+		radius = max(MIN_HEATMAP_RADIUS, min(int(radius), MAX_HEATMAP_RADIUS))
+		self._heatmap_radius = radius
+		blur = max(MIN_HEATMAP_BLUR, min(int(blur), MAX_HEATMAP_BLUR))
+		if blur % 2 == 0 and blur != 0:
+			blur += 1
+		self._heatmap_blur = blur
+
 	def process_frame(
 		self,
 		frame: np.ndarray,
 		conf: float,
 		iou: float,
-	) -> np.ndarray:
+	) -> Tuple[np.ndarray, np.ndarray]:
 		return self.track_frame(frame, conf, iou)
 
 	def track_frame(
@@ -125,7 +160,7 @@ class FishTracker:
 		frame: np.ndarray,
 		conf: float,
 		iou: float,
-	) -> np.ndarray:
+	) -> Tuple[np.ndarray, np.ndarray]:
 		"""Run Ultralytics tracking on a single frame (context7 Ultralytics guidance)."""
 		model = self._load_model()
 		frame_for_model = self._apply_roi_mask(frame)
@@ -140,26 +175,29 @@ class FishTracker:
 
 		if not results:
 			output = frame.copy()
+			heatmap = self._update_heatmap([], frame.shape)
 			self._draw_roi(output)
-			return output
+			return output, heatmap
 
 		result = results[0]
 		annotated_frame = result.plot()
-		self._update_trails(result)
+		centers = self._update_trails(result)
 		output = self._compose_display_frame(frame, annotated_frame)
 		self._draw_trails(output)
 		self._draw_roi(output)
-		return output
+		heatmap = self._update_heatmap(centers, frame.shape)
+		return output, heatmap
 
-	def _update_trails(self, result) -> None:
+	def _update_trails(self, result) -> List[Tuple[int, int]]:
 		boxes = result.boxes
 		if boxes is None or boxes.id is None:
 			self._track_history.clear()
-			return
+			return []
 
 		ids = boxes.id.int().tolist()
 		xyxy = boxes.xyxy.tolist()
 		current_ids = set()
+		centers: List[Tuple[int, int]] = []
 
 		for track_id, box in zip(ids, xyxy):
 			current_ids.add(track_id)
@@ -167,10 +205,13 @@ class FishTracker:
 			cx = int((x1 + x2) / 2)
 			cy = int((y1 + y2) / 2)
 			self._track_history[track_id].append((cx, cy))
+			centers.append((cx, cy))
 
 		for track_id in list(self._track_history.keys()):
 			if track_id not in current_ids:
 				self._track_history.pop(track_id, None)
+
+		return centers
 
 	def _draw_trails(self, frame: np.ndarray) -> None:
 		for points in self._track_history.values():
@@ -178,6 +219,43 @@ class FishTracker:
 				continue
 			for start, end in zip(points, list(points)[1:]):
 				cv2.line(frame, start, end, TRACK_COLOR, 2)
+
+	def _ensure_heatmap(self, shape: Tuple[int, int, int]) -> None:
+		height, width = shape[:2]
+		if self._heatmap is None or self._heatmap.shape != (height, width):
+			self._heatmap = np.zeros((height, width), dtype=np.float32)
+
+	def _update_heatmap(
+		self,
+		centers: List[Tuple[int, int]],
+		frame_shape: Tuple[int, int, int],
+	) -> np.ndarray:
+		self._ensure_heatmap(frame_shape)
+		assert self._heatmap is not None
+		self._heatmap *= self._heatmap_decay
+		if centers:
+			temp = np.zeros_like(self._heatmap)
+			for cx, cy in centers:
+				if cx < 0 or cy < 0:
+					continue
+				if cx >= self._heatmap.shape[1] or cy >= self._heatmap.shape[0]:
+					continue
+				cv2.circle(temp, (cx, cy), self._heatmap_radius, self._heatmap_gain, -1)
+			self._heatmap = cv2.add(self._heatmap, temp)
+		heatmap_display = self._heatmap.copy()
+		if self._heatmap_blur > 0:
+			ksize = self._heatmap_blur if self._heatmap_blur % 2 == 1 else self._heatmap_blur + 1
+			if ksize > 1:
+				heatmap_display = cv2.GaussianBlur(heatmap_display, (ksize, ksize), 0)
+		min_val = float(np.min(heatmap_display))
+		max_val = float(np.max(heatmap_display))
+		if max_val - min_val > 1e-6:
+			scaled = (heatmap_display - min_val) / (max_val - min_val)
+		else:
+			scaled = heatmap_display / (max_val + 1e-6)
+		normalized = np.clip(scaled * 255.0, 0, 255).astype(np.uint8)
+		colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+		return colored
 
 	def _compose_display_frame(
 		self,
@@ -255,13 +333,23 @@ def tracking_generator(
 	roi_y_min: float,
 	roi_x_max: float,
 	roi_y_max: float,
+	heatmap_decay: float,
+	heatmap_gain: float,
+	heatmap_radius: float,
+	heatmap_blur: float,
 	shared_state: Dict[str, bool],
-) -> Iterator[Tuple[Any, Dict[str, bool]]]:
+) -> Iterator[Tuple[Any, Any, Dict[str, bool]]]:
 	shared_state["stop"] = False
 
 	tracker = GLOBAL_TRACKER
 	tracker.set_trail_length(int(trail_length))
 	tracker.set_roi(roi_x_min, roi_y_min, roi_x_max, roi_y_max)
+	tracker.set_heatmap_params(
+		decay=heatmap_decay,
+		gain=heatmap_gain,
+		radius=int(heatmap_radius),
+		blur=int(heatmap_blur),
+	)
 	tracker.reset()
 
 	try:
@@ -278,7 +366,7 @@ def tracking_generator(
 		shared_state["stop"] = True
 		cap.release()
 		tracker.reset()
-		yield gr.update(value=None), shared_state
+		yield gr.update(value=None), gr.update(value=None), shared_state
 		return
 
 	prev_time = time.time()
@@ -291,7 +379,7 @@ def tracking_generator(
 				gr.Warning("Camera frame grab failed. Stopping stream.")
 				break
 
-			annotated = tracker.process_frame(
+			annotated, heatmap = tracker.process_frame(
 				frame, conf_threshold, iou_threshold
 			)
 
@@ -325,19 +413,21 @@ def tracking_generator(
 			)
 
 			rgb_frame = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-			yield rgb_frame, shared_state
+			heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+			yield rgb_frame, heatmap_rgb, shared_state
 
 	finally:
 		shared_state["stop"] = True
 		tracker.reset()
 		cap.release()
 
-	yield gr.update(value=None), shared_state
+	yield gr.update(value=None), gr.update(value=None), shared_state
 
 
 def stop_tracking(shared_state: Dict[str, bool]):
 	shared_state["stop"] = True
 	return (
+		gr.update(value=None),
 		gr.update(value=None),
 		shared_state,
 	)
@@ -363,13 +453,14 @@ def build_interface() -> gr.Blocks:
 
 		gr.Markdown("## YOLOv11 Fish Detector")
 
+		output_image = gr.Image(
+			label="Annotated Feed",
+			streaming=True,
+			interactive=False,
+			height=480,
+		)
+
 		with gr.Row(equal_height=True):
-			output_image = gr.Image(
-				label="Annotated Feed",
-				streaming=True,
-				interactive=False,
-				scale=2,
-			)
 			with gr.Column(scale=1):
 				with gr.Group():
 					gr.Markdown("### Cameras")
@@ -381,7 +472,7 @@ def build_interface() -> gr.Blocks:
 					)
 					refresh_btn = gr.Button("Refresh Cameras")
 				with gr.Group():
-					gr.Markdown("### Detection Adjustments")
+					gr.Markdown("### Detection & Trails")
 					conf_slider = gr.Slider(
 						minimum=MIN_CONF_THRESHOLD,
 						maximum=MAX_CONF_THRESHOLD,
@@ -434,10 +525,45 @@ def build_interface() -> gr.Blocks:
 						label="ROI Y Max",
 					)
 					roi_reset_btn = gr.Button("Reset ROI")
-
-		with gr.Row():
-			start_btn = gr.Button("Start Detection", variant="primary")
-			stop_btn = gr.Button("Stop Detection")
+				with gr.Group():
+					gr.Markdown("### Heatmap Settings")
+					heatmap_decay_slider = gr.Slider(
+						minimum=MIN_HEATMAP_DECAY,
+						maximum=MAX_HEATMAP_DECAY,
+						value=DEFAULT_HEATMAP_DECAY,
+						step=0.01,
+						label="Decay (0=fade faster)",
+					)
+					heatmap_gain_slider = gr.Slider(
+						minimum=MIN_HEATMAP_GAIN,
+						maximum=MAX_HEATMAP_GAIN,
+						value=DEFAULT_HEATMAP_GAIN,
+						step=0.1,
+						label="Intensity Gain",
+					)
+					heatmap_radius_slider = gr.Slider(
+						minimum=MIN_HEATMAP_RADIUS,
+						maximum=MAX_HEATMAP_RADIUS,
+						value=DEFAULT_HEATMAP_RADIUS,
+						step=1,
+						label="Point Radius",
+					)
+					heatmap_blur_slider = gr.Slider(
+						minimum=MIN_HEATMAP_BLUR,
+						maximum=MAX_HEATMAP_BLUR,
+						value=DEFAULT_HEATMAP_BLUR,
+						step=1,
+						label="Blur Kernel Size",
+					)
+				with gr.Row():
+					start_btn = gr.Button("Start Tracking", variant="primary")
+					stop_btn = gr.Button("Stop Tracking")
+			with gr.Column(scale=3):
+				heatmap_image = gr.Image(
+					label="Movement Heatmap",
+					streaming=True,
+					interactive=False,
+				)
 
 		start_btn.click(
 			fn=tracking_generator,
@@ -450,15 +576,19 @@ def build_interface() -> gr.Blocks:
 				roi_y_min_slider,
 				roi_x_max_slider,
 				roi_y_max_slider,
+				heatmap_decay_slider,
+				heatmap_gain_slider,
+				heatmap_radius_slider,
+				heatmap_blur_slider,
 				shared_state,
 			],
-			outputs=[output_image, shared_state],
+			outputs=[output_image, heatmap_image, shared_state],
 		)
 
 		stop_btn.click(
 			fn=stop_tracking,
 			inputs=[shared_state],
-			outputs=[output_image, shared_state],
+			outputs=[output_image, heatmap_image, shared_state],
 		)
 
 		refresh_btn.click(fn=refresh_camera_choices, outputs=camera_dropdown)
