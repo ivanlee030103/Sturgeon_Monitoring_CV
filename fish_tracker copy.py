@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Deque, Dict, Iterator, List, Tuple
 
 import cv2
 import gradio as gr
@@ -14,10 +15,19 @@ from ultralytics import YOLO  # type: ignore[attr-defined]
 
 
 MODEL_PATH = Path(__file__).with_name("best_yolo11.pt").resolve()
+TRACKER_CONFIG_PATH = Path(__file__).with_name("botsort_lowfps.yaml").resolve()
+DEFAULT_TRACKER_CONFIG = "botsort.yaml"
 DEFAULT_CAMERA_INDEX = 0
 MAX_CAMERA_INDEX = 8
+DEFAULT_TRAIL_LENGTH = 32
+MIN_TRAIL_LENGTH = 4
+MAX_TRAIL_LENGTH = 128
+DEFAULT_ROI = (0.0, 0.0, 1.0, 1.0)
+ROI_TOLERANCE = 1e-3
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
+TRACK_COLOR = (0, 255, 255)
+ROI_COLOR = (255, 140, 0)
 FPS_SMOOTHING = 0.9
 DEFAULT_CONF_THRESHOLD = 0.5
 MIN_CONF_THRESHOLD = 0.1
@@ -35,6 +45,21 @@ class FishTracker:
 		self._model_path = model_path
 		self._model: YOLO | None = None
 		self._model_lock = threading.Lock()
+		self._tracker_config = self._resolve_tracker_config()
+		self._trail_length = DEFAULT_TRAIL_LENGTH
+		self._track_history: Dict[int, Deque[Tuple[int, int]]] = defaultdict(
+			self._new_history
+		)
+		self._roi = DEFAULT_ROI
+
+	def _new_history(self) -> Deque[Tuple[int, int]]:
+		return deque(maxlen=self._trail_length)
+
+	def _resolve_tracker_config(self) -> str:
+		"""Return a tracker config path if available, otherwise fall back to default."""
+		if TRACKER_CONFIG_PATH.exists():
+			return str(TRACKER_CONFIG_PATH)
+		return DEFAULT_TRACKER_CONFIG
 
 	def _load_model(self) -> YOLO:
 		with self._model_lock:
@@ -47,6 +72,7 @@ class FishTracker:
 		return self._model
 
 	def reset(self) -> None:
+		self._track_history = defaultdict(self._new_history)
 		model = self._load_model()
 		reset_fn = getattr(model, "reset_tracker", None)
 		if callable(reset_fn):
@@ -57,26 +83,144 @@ class FishTracker:
 			except AttributeError:
 				pass
 
+	def set_trail_length(self, length: int) -> None:
+		length = max(MIN_TRAIL_LENGTH, min(int(length), MAX_TRAIL_LENGTH))
+		if length == self._trail_length:
+			return
+		self._trail_length = length
+		trimmed: Dict[int, Deque[Tuple[int, int]]] = {}
+		for track_id, points in self._track_history.items():
+			trimmed[track_id] = deque(points, maxlen=length)
+		self._track_history = defaultdict(self._new_history, trimmed)
+
+	def set_roi(
+		self,
+		x_min: float,
+		y_min: float,
+		x_max: float,
+		y_max: float,
+	) -> None:
+		x1 = float(max(0.0, min(1.0, x_min)))
+		y1 = float(max(0.0, min(1.0, y_min)))
+		x2 = float(max(0.0, min(1.0, x_max)))
+		y2 = float(max(0.0, min(1.0, y_max)))
+		if x2 - x1 < 0.02:
+			x2 = min(1.0, x1 + 0.02)
+		if y2 - y1 < 0.02:
+			y2 = min(1.0, y1 + 0.02)
+		x1, x2 = sorted((x1, x2))
+		y1, y2 = sorted((y1, y2))
+		self._roi = (x1, y1, x2, y2)
+
 	def process_frame(
 		self,
 		frame: np.ndarray,
 		conf: float,
 		iou: float,
 	) -> np.ndarray:
+		return self.track_frame(frame, conf, iou)
+
+	def track_frame(
+		self,
+		frame: np.ndarray,
+		conf: float,
+		iou: float,
+	) -> np.ndarray:
+		"""Run Ultralytics tracking on a single frame (context7 Ultralytics guidance)."""
 		model = self._load_model()
-		results = model.predict(
-			frame,
+		frame_for_model = self._apply_roi_mask(frame)
+		results = model.track(
+			frame_for_model,
 			conf=conf,
 			iou=iou,
+			tracker=self._tracker_config,
+			persist=True,
 			verbose=False,
 		)
 
 		if not results:
-			return frame
+			output = frame.copy()
+			self._draw_roi(output)
+			return output
 
 		result = results[0]
 		annotated_frame = result.plot()
-		return annotated_frame
+		self._update_trails(result)
+		output = self._compose_display_frame(frame, annotated_frame)
+		self._draw_trails(output)
+		self._draw_roi(output)
+		return output
+
+	def _update_trails(self, result) -> None:
+		boxes = result.boxes
+		if boxes is None or boxes.id is None:
+			self._track_history.clear()
+			return
+
+		ids = boxes.id.int().tolist()
+		xyxy = boxes.xyxy.tolist()
+		current_ids = set()
+
+		for track_id, box in zip(ids, xyxy):
+			current_ids.add(track_id)
+			x1, y1, x2, y2 = box
+			cx = int((x1 + x2) / 2)
+			cy = int((y1 + y2) / 2)
+			self._track_history[track_id].append((cx, cy))
+
+		for track_id in list(self._track_history.keys()):
+			if track_id not in current_ids:
+				self._track_history.pop(track_id, None)
+
+	def _draw_trails(self, frame: np.ndarray) -> None:
+		for points in self._track_history.values():
+			if len(points) < 2:
+				continue
+			for start, end in zip(points, list(points)[1:]):
+				cv2.line(frame, start, end, TRACK_COLOR, 2)
+
+	def _compose_display_frame(
+		self,
+		original: np.ndarray,
+		annotated: np.ndarray,
+	) -> np.ndarray:
+		if self._roi_is_full():
+			return annotated
+		x1, y1, x2, y2 = self._roi_pixels(original.shape)
+		output = original.copy()
+		output[y1:y2, x1:x2] = annotated[y1:y2, x1:x2]
+		return output
+
+	def _apply_roi_mask(self, frame: np.ndarray) -> np.ndarray:
+		if self._roi_is_full():
+			return frame.copy()
+		x1, y1, x2, y2 = self._roi_pixels(frame.shape)
+		masked = np.zeros_like(frame)
+		masked[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+		return masked
+
+	def _draw_roi(self, frame: np.ndarray) -> None:
+		if self._roi_is_full():
+			return
+		x1, y1, x2, y2 = self._roi_pixels(frame.shape)
+		cv2.rectangle(frame, (x1, y1), (x2, y2), ROI_COLOR, 2)
+
+	def _roi_pixels(self, shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
+		height, width = shape[:2]
+		x1 = int(self._roi[0] * width)
+		y1 = int(self._roi[1] * height)
+		x2 = int(self._roi[2] * width)
+		y2 = int(self._roi[3] * height)
+		return x1, y1, x2, y2
+
+	def _roi_is_full(self) -> bool:
+		x1, y1, x2, y2 = self._roi
+		return (
+			x1 <= ROI_TOLERANCE
+			and y1 <= ROI_TOLERANCE
+			and (1.0 - x2) <= ROI_TOLERANCE
+			and (1.0 - y2) <= ROI_TOLERANCE
+		)
 
 
 def list_cameras(max_index: int = MAX_CAMERA_INDEX) -> List[str]:
@@ -106,11 +250,18 @@ def tracking_generator(
 	camera_index: str | int,
 	conf_threshold: float,
 	iou_threshold: float,
+	trail_length: float,
+	roi_x_min: float,
+	roi_y_min: float,
+	roi_x_max: float,
+	roi_y_max: float,
 	shared_state: Dict[str, bool],
 ) -> Iterator[Tuple[Any, Dict[str, bool]]]:
 	shared_state["stop"] = False
 
 	tracker = GLOBAL_TRACKER
+	tracker.set_trail_length(int(trail_length))
+	tracker.set_roi(roi_x_min, roi_y_min, roi_x_max, roi_y_max)
 	tracker.reset()
 
 	try:
@@ -198,6 +349,11 @@ def refresh_camera_choices():
 	return gr.update(choices=choices, value=default_value)
 
 
+def reset_roi_values():
+	x1, y1, x2, y2 = DEFAULT_ROI
+	return x1, y1, x2, y2
+
+
 def build_interface() -> gr.Blocks:
 	initial_choices = list_cameras()
 	default_choice = initial_choices[0] if initial_choices else str(DEFAULT_CAMERA_INDEX)
@@ -240,6 +396,44 @@ def build_interface() -> gr.Blocks:
 						step=0.05,
 						label="IoU Threshold",
 					)
+					trail_slider = gr.Slider(
+						minimum=MIN_TRAIL_LENGTH,
+						maximum=MAX_TRAIL_LENGTH,
+						value=DEFAULT_TRAIL_LENGTH,
+						step=1,
+						label="Trail Length",
+					)
+				with gr.Group():
+					gr.Markdown("### Region of Interest (normalized 0-1)")
+					roi_x_min_slider = gr.Slider(
+						minimum=0.0,
+						maximum=0.9,
+						value=DEFAULT_ROI[0],
+						step=0.01,
+						label="ROI X Min",
+					)
+					roi_y_min_slider = gr.Slider(
+						minimum=0.0,
+						maximum=0.9,
+						value=DEFAULT_ROI[1],
+						step=0.01,
+						label="ROI Y Min",
+					)
+					roi_x_max_slider = gr.Slider(
+						minimum=0.1,
+						maximum=1.0,
+						value=DEFAULT_ROI[2],
+						step=0.01,
+						label="ROI X Max",
+					)
+					roi_y_max_slider = gr.Slider(
+						minimum=0.1,
+						maximum=1.0,
+						value=DEFAULT_ROI[3],
+						step=0.01,
+						label="ROI Y Max",
+					)
+					roi_reset_btn = gr.Button("Reset ROI")
 
 		with gr.Row():
 			start_btn = gr.Button("Start Detection", variant="primary")
@@ -251,6 +445,11 @@ def build_interface() -> gr.Blocks:
 				camera_dropdown,
 				conf_slider,
 				iou_slider,
+				trail_slider,
+				roi_x_min_slider,
+				roi_y_min_slider,
+				roi_x_max_slider,
+				roi_y_max_slider,
 				shared_state,
 			],
 			outputs=[output_image, shared_state],
@@ -263,6 +462,15 @@ def build_interface() -> gr.Blocks:
 		)
 
 		refresh_btn.click(fn=refresh_camera_choices, outputs=camera_dropdown)
+		roi_reset_btn.click(
+			fn=reset_roi_values,
+			outputs=[
+				roi_x_min_slider,
+				roi_y_min_slider,
+				roi_x_max_slider,
+				roi_y_max_slider,
+			],
+		)
 
 	return demo
 
