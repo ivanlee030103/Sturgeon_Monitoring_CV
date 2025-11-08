@@ -225,9 +225,9 @@ class BehaviorAnalyzer:
                 units="px/frame",
                 window_min=60.0,
                 window_max=120.0,
-                threshold=-2.5,
+                threshold=-0.5,
                 direction="below",
-                min_duration=120.0,
+                min_duration=2.0,
                 alert_message="Low DO / post-handling / temperature shock?",
                 percent_display=False,
                 skip_when_night=True,
@@ -1071,6 +1071,7 @@ class YoloTrackerWindow(QMainWindow):
         self.behavior_metric_configs = self.behavior_worker.metric_configs
         self.behavior_cards: Dict[str, Dict[str, QLabel]] = {}
         self.behavior_enabled = True
+        self.active_alerts: Dict[str, str] = {}
         
         # Setup UI
         self.setup_ui()
@@ -1179,6 +1180,33 @@ class YoloTrackerWindow(QMainWindow):
             self.behavior_cards[key] = card
         return behavior_group
 
+    def create_alert_widget(self):
+        alert_group = QGroupBox("Behavior Alerts")
+        alert_group.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 16px;
+                color: white;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }
+        """)
+        layout = QVBoxLayout(alert_group)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(4)
+
+        self.alert_label = QLabel("No active alerts")
+        self.alert_label.setWordWrap(True)
+        self.alert_label.setStyleSheet("color: #f5f5f5; font-size: 12px;")
+        layout.addWidget(self.alert_label)
+        return alert_group
+
     def _create_behavior_card(self, title: str, description: str):
         card_widget = QWidget()
         card_layout = QVBoxLayout(card_widget)
@@ -1248,6 +1276,27 @@ class YoloTrackerWindow(QMainWindow):
                 value_label.setText("-- | z n/a")
                 value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #80cbc4;")
 
+    def refresh_alert_display(self):
+        if not hasattr(self, "alert_label"):
+            return
+        if not self.behavior_enabled:
+            self.alert_label.setText("Behavior analysis disabled")
+            self.alert_label.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+            return
+        if not self.active_alerts:
+            self.alert_label.setText("No active alerts")
+            self.alert_label.setStyleSheet("color: #8bc34a; font-size: 12px;")
+            return
+        lines = []
+        for key, message in self.active_alerts.items():
+            cfg = self.behavior_metric_configs.get(key)
+            if cfg is None:
+                lines.append(f"- {message}")
+            else:
+                lines.append(f"- {cfg.title}: {message}")
+        self.alert_label.setText("\n".join(lines))
+        self.alert_label.setStyleSheet("color: #ffab91; font-size: 12px;")
+
     def drain_behavior_results(self):
         if (not hasattr(self, "behavior_worker") or self.behavior_worker is None
                 or not self.behavior_enabled):
@@ -1262,8 +1311,11 @@ class YoloTrackerWindow(QMainWindow):
                 self.log_message(f"[{prefix}] {event.title}: {event.message}")
                 if event.active:
                     logger.warning(f"{prefix} {event.title}: {event.message}")
+                    self.active_alerts[event.key] = event.message
                 else:
                     logger.info(f"{prefix} {event.title}: {event.message}")
+                    self.active_alerts.pop(event.key, None)
+        self.refresh_alert_display()
 
     def setup_config_panel(self, parent_layout):
         """Setup the configuration panel on the right"""
@@ -1272,15 +1324,20 @@ class YoloTrackerWindow(QMainWindow):
         self.config_panel.config_changed.connect(self.on_config_changed)
         behavior_widget = self.create_behavior_widget()
         self.config_panel.add_behavior_widget(behavior_widget)
+        alert_widget = self.create_alert_widget()
+        self.config_panel.add_behavior_widget(alert_widget)
+        self.refresh_alert_display()
         parent_layout.addWidget(self.config_panel, 1)  # Takes 1/3 of space
 
     def on_behavior_enabled_toggled(self, checked: bool):
         self.behavior_enabled = checked
         self.behavior_worker.reset()
+        self.active_alerts.clear()
         if not checked:
             self.set_behavior_cards_disabled(True)
         else:
             self.set_behavior_cards_disabled(False)
+        self.refresh_alert_display()
 
     def init_heatmap_state(self):
         """Initialize heatmap buffers and defaults"""
@@ -1568,6 +1625,8 @@ class YoloTrackerWindow(QMainWindow):
             self.reset_heatmap()
             if self.behavior_enabled:
                 self.behavior_worker.reset()
+                self.active_alerts.clear()
+                self.refresh_alert_display()
             
             # Start processing
             self.is_processing = True
