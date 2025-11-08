@@ -6,6 +6,9 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
+import queue
+import threading
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -575,6 +578,89 @@ class BehaviorAnalyzer:
         return reading, alert_event
 
 
+class BehaviorAnalysisThread:
+    """Background worker that runs BehaviorAnalyzer off the UI thread."""
+
+    def __init__(self):
+        self.analyzer = BehaviorAnalyzer()
+        self.metric_configs = self.analyzer.metric_configs
+        self._task_queue: "queue.Queue[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]]" = queue.Queue(maxsize=1)
+        self._result_queue: "queue.Queue[Optional[BehaviorAnalysisResult]]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._worker_loop, name="BehaviorAnalysisThread", daemon=True)
+        self._thread.start()
+
+    def submit(self, frame: Optional[np.ndarray], boxes) -> None:
+        """Queue the latest frame + boxes snapshot for analysis."""
+        if frame is None or self._stop_event.is_set():
+            return
+        snapshot = (frame.copy(), self._snapshot_boxes(boxes))
+        try:
+            self._task_queue.put_nowait(snapshot)
+        except queue.Full:
+            try:
+                self._task_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._task_queue.put_nowait(snapshot)
+
+    def consume_results(self) -> List[BehaviorAnalysisResult]:
+        """Retrieve all available analysis outputs."""
+        results: List[BehaviorAnalysisResult] = []
+        while True:
+            try:
+                item = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                results.append(item)
+        return results
+
+    def reset(self):
+        """Reset analyzer state and clear pending work/results."""
+        self.analyzer.reset()
+        self._clear_queue(self._task_queue)
+        self._clear_queue(self._result_queue)
+
+    def shutdown(self):
+        """Signal the worker to exit."""
+        self._stop_event.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except RuntimeError:
+            pass
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                frame, boxes_snapshot = self._task_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            boxes_obj = None if boxes_snapshot is None else SimpleNamespace(xyxy=boxes_snapshot)
+            result = self.analyzer.analyze(frame, boxes_obj)
+            if result is not None:
+                self._result_queue.put(result)
+
+    @staticmethod
+    def _snapshot_boxes(boxes) -> Optional[np.ndarray]:
+        if boxes is None or getattr(boxes, "xyxy", None) is None:
+            return None
+        xyxy = boxes.xyxy
+        if hasattr(xyxy, "detach"):
+            xyxy = xyxy.detach().cpu().numpy()
+        else:
+            xyxy = np.asarray(xyxy)
+        return xyxy.copy()
+
+    @staticmethod
+    def _clear_queue(q: "queue.Queue"):
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            return
+
+
 # ---------------- Source helpers ----------------
 def validate_source(src: str):
     """
@@ -981,8 +1067,10 @@ class YoloTrackerWindow(QMainWindow):
         self.frames_done = 0
         self.is_processing = False
         self.init_heatmap_state()
-        self.behavior_analyzer = BehaviorAnalyzer()
+        self.behavior_worker = BehaviorAnalysisThread()
+        self.behavior_metric_configs = self.behavior_worker.metric_configs
         self.behavior_cards: Dict[str, Dict[str, QLabel]] = {}
+        self.behavior_enabled = True
         
         # Setup UI
         self.setup_ui()
@@ -1075,10 +1163,15 @@ class YoloTrackerWindow(QMainWindow):
         layout.setContentsMargins(12, 8, 12, 12)
         layout.setSpacing(8)
 
+        self.behavior_toggle = QCheckBox("Enable Behavior Analysis")
+        self.behavior_toggle.setChecked(True)
+        self.behavior_toggle.toggled.connect(self.on_behavior_enabled_toggled)
+        layout.addWidget(self.behavior_toggle)
+
         # Ensure consistent ordering (Lethargy first, others below)
         ordered_keys = ["activity", "crowding", "edge", "inflow"]
         for key in ordered_keys:
-            cfg = self.behavior_analyzer.metric_configs.get(key)
+            cfg = self.behavior_metric_configs.get(key)
             if cfg is None:
                 continue
             card = self._create_behavior_card(cfg.title, cfg.description)
@@ -1116,7 +1209,7 @@ class YoloTrackerWindow(QMainWindow):
         }
 
     def update_behavior_ui(self, readings: Dict[str, MetricReading]):
-        if not readings:
+        if not self.behavior_enabled or not readings:
             return
 
         for key, reading in readings.items():
@@ -1140,6 +1233,38 @@ class YoloTrackerWindow(QMainWindow):
                 status_label.setStyleSheet("color: #c8c8c8; font-size: 11px;")
                 value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #80cbc4;")
 
+    def set_behavior_cards_disabled(self, disabled: bool):
+        for card in self.behavior_cards.values():
+            value_label: QLabel = card["value_label"]  # type: ignore[index]
+            status_label: QLabel = card["status_label"]  # type: ignore[index]
+            if disabled:
+                value_label.setText("-- | z n/a")
+                value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #888888;")
+                status_label.setText("Behavior analysis disabled")
+                status_label.setStyleSheet("color: #888888; font-size: 11px;")
+            else:
+                status_label.setText("Waiting for data...")
+                status_label.setStyleSheet("color: #c8c8c8; font-size: 11px;")
+                value_label.setText("-- | z n/a")
+                value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #80cbc4;")
+
+    def drain_behavior_results(self):
+        if (not hasattr(self, "behavior_worker") or self.behavior_worker is None
+                or not self.behavior_enabled):
+            return
+        analyses = self.behavior_worker.consume_results()
+        for analysis in analyses:
+            if analysis is None:
+                continue
+            self.update_behavior_ui(analysis.readings)
+            for event in analysis.events:
+                prefix = "ALERT" if event.active else "RESOLVED"
+                self.log_message(f"[{prefix}] {event.title}: {event.message}")
+                if event.active:
+                    logger.warning(f"{prefix} {event.title}: {event.message}")
+                else:
+                    logger.info(f"{prefix} {event.title}: {event.message}")
+
     def setup_config_panel(self, parent_layout):
         """Setup the configuration panel on the right"""
         self.config_panel = ConfigurationPanel(config)
@@ -1148,6 +1273,14 @@ class YoloTrackerWindow(QMainWindow):
         behavior_widget = self.create_behavior_widget()
         self.config_panel.add_behavior_widget(behavior_widget)
         parent_layout.addWidget(self.config_panel, 1)  # Takes 1/3 of space
+
+    def on_behavior_enabled_toggled(self, checked: bool):
+        self.behavior_enabled = checked
+        self.behavior_worker.reset()
+        if not checked:
+            self.set_behavior_cards_disabled(True)
+        else:
+            self.set_behavior_cards_disabled(False)
 
     def init_heatmap_state(self):
         """Initialize heatmap buffers and defaults"""
@@ -1433,7 +1566,8 @@ class YoloTrackerWindow(QMainWindow):
             self.meter = FpsMeter(window_len=60, ema_alpha=0.1)
             self.frames_done = 0
             self.reset_heatmap()
-            self.behavior_analyzer.reset()
+            if self.behavior_enabled:
+                self.behavior_worker.reset()
             
             # Start processing
             self.is_processing = True
@@ -1455,6 +1589,7 @@ class YoloTrackerWindow(QMainWindow):
             
         self.is_processing = False
         self.timer.stop()
+        self.drain_behavior_results()
         self.config_panel.set_start_button_state(False)
         
         if self.frames_done > 0:
@@ -1467,6 +1602,8 @@ class YoloTrackerWindow(QMainWindow):
         """Process a single frame (called by timer)"""
         if not self.is_processing or self.results_gen is None:
             return
+
+        self.drain_behavior_results()
             
         try:
             self.meter.start()  # measure end-to-end: next() + plot + display
@@ -1510,16 +1647,8 @@ class YoloTrackerWindow(QMainWindow):
                 self.log_message(debug_msg)
                 logger.debug(debug_msg)
 
-            analysis = self.behavior_analyzer.analyze(orig_frame, res.boxes)
-            if analysis is not None:
-                self.update_behavior_ui(analysis.readings)
-                for event in analysis.events:
-                    prefix = "ALERT" if event.active else "RESOLVED"
-                    self.log_message(f"[{prefix}] {event.title}: {event.message}")
-                    if event.active:
-                        logger.warning(f"{prefix} {event.title}: {event.message}")
-                    else:
-                        logger.info(f"{prefix} {event.title}: {event.message}")
+            if self.behavior_enabled:
+                self.behavior_worker.submit(orig_frame, res.boxes)
             
             # Convert BGR to RGB for Qt
             rgb_image = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
@@ -1557,6 +1686,8 @@ class YoloTrackerWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle window close event"""
         self.stop_detection()
+        if hasattr(self, "behavior_worker") and self.behavior_worker is not None:
+            self.behavior_worker.shutdown()
         logger.info("Resources cleaned up. Application terminated.")
         event.accept()
 
