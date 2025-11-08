@@ -1,6 +1,12 @@
 import logging
+import math
 import sys
+import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Deque, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
 import psutil
@@ -115,6 +121,460 @@ class FpsMeter:
         return float(self._tp_last_value)
 
 
+class StreamingStats:
+    """Online mean/std calculator (Welford) for alert z-scores."""
+    def __init__(self):
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def reset(self):
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, value: float):
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        delta2 = value - self.mean
+        self.m2 += delta * delta2
+
+    def variance(self) -> float:
+        if self.count < 2:
+            return 0.0
+        return self.m2 / (self.count - 1)
+
+    def std(self) -> float:
+        var = self.variance()
+        return math.sqrt(var) if var > 0 else 0.0
+
+    def z_score(self, value: float) -> Optional[float]:
+        if self.count < 2:
+            return None
+        std = self.std()
+        if std <= 1e-6:
+            return None
+        return (value - self.mean) / std
+
+
+@dataclass
+class MetricReading:
+    key: str
+    title: str
+    value_text: str
+    z_text: str
+    status: str
+    alert_active: bool
+    coverage_ready: bool
+    alert_message: Optional[str] = None
+
+
+@dataclass
+class BehaviorAlertEvent:
+    key: str
+    title: str
+    message: str
+    active: bool
+
+
+@dataclass
+class BehaviorMetricConfig:
+    key: str
+    title: str
+    description: str
+    units: str
+    window_min: float
+    window_max: float
+    threshold: float
+    direction: str  # "above" or "below"
+    min_duration: float
+    alert_message: str
+    percent_display: bool = False
+    skip_when_night: bool = False
+
+
+@dataclass
+class BehaviorMetricState:
+    history: Deque[Tuple[float, float]]
+    stats: StreamingStats
+    breach_since: Optional[float] = None
+    alert_active: bool = False
+
+
+@dataclass
+class BehaviorAnalysisResult:
+    readings: Dict[str, MetricReading]
+    events: List[BehaviorAlertEvent]
+
+
+class BehaviorAnalyzer:
+    """Derives behavior metrics from YOLO results + optical flow."""
+
+    NIGHT_LUMA_THRESHOLD = 28.0
+
+    def __init__(self):
+        self.metric_configs = {
+            "activity": BehaviorMetricConfig(
+                key="activity",
+                title="Lethargy / Activity Drop",
+                description="Optical-flow slowdown across detections",
+                units="px/frame",
+                window_min=60.0,
+                window_max=120.0,
+                threshold=-2.5,
+                direction="below",
+                min_duration=120.0,
+                alert_message="Low DO / post-handling / temperature shock?",
+                percent_display=False,
+                skip_when_night=True,
+            ),
+            "crowding": BehaviorMetricConfig(
+                key="crowding",
+                title="Clustering / Crowding",
+                description="Top 10% occupancy grid mass",
+                units="%",
+                window_min=60.0,
+                window_max=120.0,
+                threshold=3.0,
+                direction="above",
+                min_duration=60.0,
+                alert_message="Potential water quality issue or disturbance",
+                percent_display=True,
+            ),
+            "edge": BehaviorMetricConfig(
+                key="edge",
+                title="Edge (Wall-Pacing) Ratio",
+                description="Centroids hugging the perimeter band",
+                units="%",
+                window_min=45.0,
+                window_max=90.0,
+                threshold=2.5,
+                direction="above",
+                min_duration=60.0,
+                alert_message="Stress / overcrowding / barren tank?",
+                percent_display=True,
+            ),
+            "inflow": BehaviorMetricConfig(
+                key="inflow",
+                title="Inflow Magnet",
+                description="Centroids parked inside inflow ROI",
+                units="%",
+                window_min=45.0,
+                window_max=90.0,
+                threshold=3.0,
+                direction="above",
+                min_duration=60.0,
+                alert_message="Possible O₂ seeking / stratification / pump issue",
+                percent_display=True,
+            ),
+        }
+        self.metric_states: Dict[str, BehaviorMetricState] = {
+            key: BehaviorMetricState(history=deque(), stats=StreamingStats())
+            for key in self.metric_configs
+        }
+        self.prev_gray: Optional[np.ndarray] = None
+        self.last_brightness = 0.0
+        # ROI polygon defined in normalized coordinates (x, y) for inflow jet/diffuser.
+        self.inflow_roi_normalized = np.array(
+            [
+                (0.72, 0.15),
+                (0.95, 0.15),
+                (0.95, 0.35),
+                (0.72, 0.35),
+            ],
+            dtype=np.float32,
+        )
+
+    def reset(self):
+        self.prev_gray = None
+        self.last_brightness = 0.0
+        for state in self.metric_states.values():
+            state.history.clear()
+            state.stats.reset()
+            state.breach_since = None
+            state.alert_active = False
+
+    def analyze(self, frame, boxes) -> Optional[BehaviorAnalysisResult]:
+        if frame is None:
+            self.prev_gray = None
+            return None
+
+        timestamp = time.monotonic()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.last_brightness = float(np.mean(gray))
+        box_list = self._extract_boxes(boxes, frame.shape)
+        centroids = self._extract_centroids(box_list)
+
+        mean_speed = self._compute_mean_speed(gray, box_list)
+        clustering = self._compute_clustering_score(centroids, frame.shape)
+        edge_ratio = self._compute_edge_ratio(centroids, frame.shape)
+        inflow_ratio = self._compute_inflow_ratio(centroids, frame.shape)
+
+        readings: Dict[str, MetricReading] = {}
+        events: List[BehaviorAlertEvent] = []
+
+        metric_inputs = {
+            "activity": (mean_speed, self._is_night_condition()),
+            "crowding": (clustering, False),
+            "edge": (edge_ratio, False),
+            "inflow": (inflow_ratio, False),
+        }
+
+        for key, (value, skip_for_night) in metric_inputs.items():
+            cfg = self.metric_configs[key]
+            state = self.metric_states[key]
+            skip_alert = cfg.skip_when_night and skip_for_night
+            reading, alert_event = self._update_metric(cfg, state, value, timestamp, skip_alert)
+            readings[key] = reading
+            if alert_event is not None:
+                events.append(alert_event)
+
+        return BehaviorAnalysisResult(readings=readings, events=events)
+
+    def _is_night_condition(self) -> bool:
+        return self.last_brightness <= self.NIGHT_LUMA_THRESHOLD
+
+    def _extract_boxes(self, boxes, frame_shape) -> List[Tuple[int, int, int, int]]:
+        if boxes is None or getattr(boxes, "xyxy", None) is None:
+            return []
+        xyxy = boxes.xyxy
+        if hasattr(xyxy, "detach"):
+            xyxy = xyxy.detach().cpu().numpy()
+        else:
+            xyxy = np.asarray(xyxy)
+        h, w = frame_shape[:2]
+        parsed: List[Tuple[int, int, int, int]] = []
+        for x1, y1, x2, y2 in xyxy:
+            ix1 = int(max(0, min(w - 1, math.floor(x1))))
+            iy1 = int(max(0, min(h - 1, math.floor(y1))))
+            ix2 = int(max(0, min(w, math.ceil(x2))))
+            iy2 = int(max(0, min(h, math.ceil(y2))))
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            parsed.append((ix1, iy1, ix2, iy2))
+        return parsed
+
+    def _extract_centroids(self, boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int]]:
+        centers: List[Tuple[int, int]] = []
+        for x1, y1, x2, y2 in boxes:
+            cx = int((x1 + x2) * 0.5)
+            cy = int((y1 + y2) * 0.5)
+            centers.append((cx, cy))
+        return centers
+
+    def _compute_mean_speed(self, gray: np.ndarray, boxes: List[Tuple[int, int, int, int]]) -> Optional[float]:
+        if self.prev_gray is None or self.prev_gray.shape != gray.shape:
+            self.prev_gray = gray
+            return None
+        if not boxes:
+            self.prev_gray = gray
+            return None
+
+        flow = cv2.calcOpticalFlowFarneback(
+            self.prev_gray,
+            gray,
+            None,
+            0.5,
+            3,
+            15,
+            3,
+            5,
+            1.2,
+            0,
+        )
+        self.prev_gray = gray
+        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        total_sum = 0.0
+        total_pixels = 0
+        for x1, y1, x2, y2 in boxes:
+            roi = mag[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            total_sum += float(np.sum(roi))
+            total_pixels += roi.size
+        if total_pixels == 0:
+            return None
+        return total_sum / total_pixels
+
+    def _compute_clustering_score(
+        self,
+        centroids: List[Tuple[int, int]],
+        frame_shape: Tuple[int, int, int],
+    ) -> Optional[float]:
+        if not centroids:
+            return None
+        grid_size = 20
+        grid = np.zeros((grid_size, grid_size), dtype=np.float32)
+        height, width = frame_shape[:2]
+        total = float(len(centroids))
+        if width <= 0 or height <= 0:
+            return None
+        for cx, cy in centroids:
+            gx = int(np.clip((cx / max(width, 1e-6)) * grid_size, 0, grid_size - 1))
+            gy = int(np.clip((cy / max(height, 1e-6)) * grid_size, 0, grid_size - 1))
+            grid[gy, gx] += 1.0
+        grid /= total
+        flattened = np.sort(grid.ravel())
+        top_cells = max(1, int(flattened.size * 0.10))
+        score = float(np.sum(flattened[-top_cells:]))
+        return score
+
+    def _compute_edge_ratio(
+        self,
+        centroids: List[Tuple[int, int]],
+        frame_shape: Tuple[int, int, int],
+    ) -> Optional[float]:
+        if not centroids:
+            return None
+        height, width = frame_shape[:2]
+        if width <= 0 or height <= 0:
+            return None
+        margin_x = width * 0.12
+        margin_y = height * 0.12
+        edge_hits = 0
+        for cx, cy in centroids:
+            if cx <= margin_x or cx >= (width - margin_x) or cy <= margin_y or cy >= (height - margin_y):
+                edge_hits += 1
+        return edge_hits / len(centroids)
+
+    def _compute_inflow_ratio(
+        self,
+        centroids: List[Tuple[int, int]],
+        frame_shape: Tuple[int, int, int],
+    ) -> Optional[float]:
+        if not centroids:
+            return None
+        height, width = frame_shape[:2]
+        if width <= 0 or height <= 0:
+            return None
+        polygon = np.array(
+            [
+                (
+                    int(np.clip(x * width, 0, width - 1)),
+                    int(np.clip(y * height, 0, height - 1)),
+                )
+                for x, y in self.inflow_roi_normalized
+            ],
+            dtype=np.int32,
+        )
+        hits = 0
+        for cx, cy in centroids:
+            if cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False) >= 0:
+                hits += 1
+        return hits / len(centroids)
+
+    def _update_metric(
+        self,
+        cfg: BehaviorMetricConfig,
+        state: BehaviorMetricState,
+        value: Optional[float],
+        timestamp: float,
+        skip_alert: bool,
+    ) -> Tuple[MetricReading, Optional[BehaviorAlertEvent]]:
+        alert_event: Optional[BehaviorAlertEvent] = None
+        status = "No detections"
+        z_text = "z n/a"
+        value_text = "--"
+        coverage_ready = False
+        z_score = None
+
+        if value is None:
+            state.history.clear()
+            if state.alert_active:
+                state.alert_active = False
+                state.breach_since = None
+                alert_event = BehaviorAlertEvent(
+                    key=cfg.key,
+                    title=cfg.title,
+                    message="Condition cleared (no detections)",
+                    active=False,
+                )
+            reading = MetricReading(
+                key=cfg.key,
+                title=cfg.title,
+                value_text=value_text,
+                z_text=z_text,
+                status=status,
+                alert_active=False,
+                coverage_ready=False,
+            )
+            return reading, alert_event
+
+        state.history.append((timestamp, value))
+        while state.history and (timestamp - state.history[0][0]) > cfg.window_max:
+            state.history.popleft()
+
+        coverage = timestamp - state.history[0][0] if len(state.history) > 1 else 0.0
+        coverage_ready = coverage >= cfg.window_min
+        aggregated = float(np.mean([sample for _, sample in state.history])) if state.history else value
+
+        if cfg.percent_display:
+            value_text = f"{aggregated * 100:.1f} {cfg.units}"
+        else:
+            value_text = f"{aggregated:.3f} {cfg.units}"
+
+        if coverage_ready:
+            if not (skip_alert and cfg.skip_when_night):
+                state.stats.update(aggregated)
+            z_score = state.stats.z_score(aggregated)
+        else:
+            status = f"Baseline building ({coverage:.0f}/{cfg.window_min:.0f}s)"
+
+        if z_score is not None:
+            z_text = f"z {z_score:+.2f}"
+
+        meets_threshold = False
+        if coverage_ready and z_score is not None and not skip_alert:
+            if cfg.direction == "below":
+                meets_threshold = z_score <= cfg.threshold
+            else:
+                meets_threshold = z_score >= cfg.threshold
+
+        if skip_alert and coverage_ready:
+            status = "Night mode (muted)"
+        elif coverage_ready and not state.alert_active:
+            status = "Tracking (z pending)" if z_score is None else "Stable"
+
+        if meets_threshold:
+            if state.breach_since is None:
+                state.breach_since = timestamp
+            elapsed = timestamp - state.breach_since
+            if elapsed >= cfg.min_duration and not state.alert_active:
+                state.alert_active = True
+                alert_event = BehaviorAlertEvent(
+                    key=cfg.key,
+                    title=cfg.title,
+                    message=cfg.alert_message,
+                    active=True,
+                )
+        else:
+            if state.alert_active:
+                state.alert_active = False
+                alert_event = BehaviorAlertEvent(
+                    key=cfg.key,
+                    title=cfg.title,
+                    message="Condition cleared",
+                    active=False,
+                )
+            state.breach_since = None
+
+        if state.alert_active:
+            status = cfg.alert_message
+
+        reading = MetricReading(
+            key=cfg.key,
+            title=cfg.title,
+            value_text=value_text,
+            z_text=z_text,
+            status=status,
+            alert_active=state.alert_active,
+            coverage_ready=coverage_ready,
+            alert_message=cfg.alert_message if state.alert_active else None,
+        )
+        return reading, alert_event
+
+
 # ---------------- Source helpers ----------------
 def validate_source(src: str):
     """
@@ -164,6 +624,7 @@ class ConfigurationPanel(QWidget):
         scroll_area = QScrollArea()
         scroll_widget = QWidget()
         layout = QVBoxLayout(scroll_widget)
+        self.scroll_layout = layout
         
         # Model Configuration Group
         model_group = QGroupBox("Model Configuration")
@@ -339,6 +800,7 @@ class ConfigurationPanel(QWidget):
         layout.addWidget(source_group)
         layout.addWidget(detection_group)
         layout.addWidget(control_group)
+        self.behavior_insert_index = layout.count()
         layout.addStretch()
         
         # Set up scroll area
@@ -394,6 +856,14 @@ class ConfigurationPanel(QWidget):
         
         # Connect signals for config changes
         self.connect_config_signals()
+
+    def add_behavior_widget(self, widget: QWidget):
+        """Insert external widgets just above the stretch (after control group)."""
+        if not hasattr(self, "scroll_layout") or self.scroll_layout is None:
+            return
+        insert_index = getattr(self, "behavior_insert_index", self.scroll_layout.count())
+        self.scroll_layout.insertWidget(insert_index, widget)
+        self.behavior_insert_index = insert_index + 1
         
     def connect_config_signals(self):
         """Connect UI signals to config update methods"""
@@ -511,6 +981,8 @@ class YoloTrackerWindow(QMainWindow):
         self.frames_done = 0
         self.is_processing = False
         self.init_heatmap_state()
+        self.behavior_analyzer = BehaviorAnalyzer()
+        self.behavior_cards: Dict[str, Dict[str, QLabel]] = {}
         
         # Setup UI
         self.setup_ui()
@@ -580,12 +1052,101 @@ class YoloTrackerWindow(QMainWindow):
         
         # Add to main layout with stretch factor
         parent_layout.addWidget(video_container, 2)  # Takes 2/3 of space
-        
+
+    def create_behavior_widget(self):
+        """Build the behavior analytics card group."""
+        behavior_group = QGroupBox("Behavior Analysis")
+        behavior_group.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #444;
+                border-radius: 5px;
+                margin-top: 12px;
+                padding-top: 18px;
+                color: white;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }
+        """)
+        layout = QVBoxLayout(behavior_group)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(8)
+
+        # Ensure consistent ordering (Lethargy first, others below)
+        ordered_keys = ["activity", "crowding", "edge", "inflow"]
+        for key in ordered_keys:
+            cfg = self.behavior_analyzer.metric_configs.get(key)
+            if cfg is None:
+                continue
+            card = self._create_behavior_card(cfg.title, cfg.description)
+            layout.addWidget(card["widget"])
+            self.behavior_cards[key] = card
+        return behavior_group
+
+    def _create_behavior_card(self, title: str, description: str):
+        card_widget = QWidget()
+        card_layout = QVBoxLayout(card_widget)
+        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setSpacing(2)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        desc_label = QLabel(description)
+        desc_label.setWordWrap(True)
+        desc_label.setStyleSheet("color: #bbbbbb; font-size: 11px;")
+
+        value_label = QLabel("--")
+        value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #80cbc4;")
+
+        status_label = QLabel("Initializing...")
+        status_label.setStyleSheet("color: #c8c8c8; font-size: 11px;")
+
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(desc_label)
+        card_layout.addWidget(value_label)
+        card_layout.addWidget(status_label)
+
+        return {
+            "widget": card_widget,
+            "value_label": value_label,
+            "status_label": status_label,
+        }
+
+    def update_behavior_ui(self, readings: Dict[str, MetricReading]):
+        if not readings:
+            return
+
+        for key, reading in readings.items():
+            card = self.behavior_cards.get(key)
+            if not card:
+                continue
+
+            value_label: QLabel = card["value_label"]  # type: ignore[index]
+            status_label: QLabel = card["status_label"]  # type: ignore[index]
+
+            value_label.setText(f"{reading.value_text} | {reading.z_text}")
+            status_label.setText(reading.status)
+
+            if reading.alert_active:
+                status_label.setStyleSheet("color: #ff8a80; font-weight: bold; font-size: 11px;")
+                value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #ffab91;")
+            elif reading.coverage_ready:
+                status_label.setStyleSheet("color: #8bc34a; font-size: 11px;")
+                value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #a5d6a7;")
+            else:
+                status_label.setStyleSheet("color: #c8c8c8; font-size: 11px;")
+                value_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #80cbc4;")
+
     def setup_config_panel(self, parent_layout):
         """Setup the configuration panel on the right"""
         self.config_panel = ConfigurationPanel(config)
         self.config_panel.start_button.clicked.connect(self.toggle_detection)
         self.config_panel.config_changed.connect(self.on_config_changed)
+        behavior_widget = self.create_behavior_widget()
+        self.config_panel.add_behavior_widget(behavior_widget)
         parent_layout.addWidget(self.config_panel, 1)  # Takes 1/3 of space
 
     def init_heatmap_state(self):
@@ -872,6 +1433,7 @@ class YoloTrackerWindow(QMainWindow):
             self.meter = FpsMeter(window_len=60, ema_alpha=0.1)
             self.frames_done = 0
             self.reset_heatmap()
+            self.behavior_analyzer.reset()
             
             # Start processing
             self.is_processing = True
@@ -926,6 +1488,9 @@ class YoloTrackerWindow(QMainWindow):
             # Annotated frame (BGR)
             self.update_heatmap(res)
             annotated = res.plot()
+            orig_frame = getattr(res, "orig_img", None)
+            if orig_frame is None:
+                orig_frame = annotated
 
             # Stop timing for full loop
             loop_time_ms = self.meter.stop()
@@ -944,6 +1509,17 @@ class YoloTrackerWindow(QMainWindow):
                            f"{loop_time_ms:.1f} ms | TP {throughput:.2f}")
                 self.log_message(debug_msg)
                 logger.debug(debug_msg)
+
+            analysis = self.behavior_analyzer.analyze(orig_frame, res.boxes)
+            if analysis is not None:
+                self.update_behavior_ui(analysis.readings)
+                for event in analysis.events:
+                    prefix = "ALERT" if event.active else "RESOLVED"
+                    self.log_message(f"[{prefix}] {event.title}: {event.message}")
+                    if event.active:
+                        logger.warning(f"{prefix} {event.title}: {event.message}")
+                    else:
+                        logger.info(f"{prefix} {event.title}: {event.message}")
             
             # Convert BGR to RGB for Qt
             rgb_image = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
