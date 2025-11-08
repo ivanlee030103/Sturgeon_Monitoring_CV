@@ -14,7 +14,7 @@ import numpy as np
 from ultralytics import YOLO  # type: ignore[attr-defined]
 
 
-MODEL_PATH = Path(__file__).with_name("best_yolo11.pt").resolve()
+MODEL_PATH = Path(__file__).with_name("wxh-best.pt").resolve()
 DEFAULT_CAMERA_INDEX = 0
 MAX_CAMERA_INDEX = 8
 DEFAULT_TRAIL_LENGTH = 32
