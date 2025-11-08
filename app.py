@@ -578,6 +578,186 @@ class BehaviorAnalyzer:
         return reading, alert_event
 
 
+# ---------------- Heatmap Manager ----------------
+class HeatmapManager:
+    """Efficient heatmap manager with cached kernels + ROI updates."""
+
+    def __init__(self, width=640, height=480, decay_rate=0.95, max_age=300):
+        """
+        Args:
+            width: Initial heatmap width (will auto-resize to first frame size)
+            height: Initial heatmap height
+            decay_rate: Exponential decay per frame (0.0-1.0, lower = faster fade)
+            max_age: Kept for compatibility; main "lifetime" is controlled by decay_rate
+        """
+        self.width = width
+        self.height = height
+        self.decay_rate = float(np.clip(decay_rate, 0.1, 0.99))
+        self.max_age = max_age
+
+        self.heatmap = np.zeros((self.height, self.width), dtype=np.float32)
+        self.enabled = False
+
+        # Cache of small Gaussian kernels keyed by radius
+        self._kernel_cache: dict[int, np.ndarray] = {}
+
+        # Will re-size to match first frame automatically
+        self._auto_initialized = False
+        self.intensity_gain = 1.0
+        self.radius_scale = 0.5
+        self.colormap = cv2.COLORMAP_JET
+
+    # --------- internal helpers ---------
+    def _ensure_size(self, frame_width: int, frame_height: int):
+        """Auto-resize heatmap to match incoming frame size (only when needed)."""
+        if (not self._auto_initialized or
+                self.width != frame_width or
+                self.height != frame_height):
+            self.resize(frame_width, frame_height)
+            self._auto_initialized = True
+
+    def _get_kernel(self, radius: int) -> np.ndarray:
+        """
+        Return a cached 2D Gaussian-like kernel for a given radius.
+        Kernel is normalized to max=1.
+        """
+        radius = int(max(1, radius))
+        if radius in self._kernel_cache:
+            return self._kernel_cache[radius]
+
+        size = radius * 2 + 1
+        y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        dist2 = x * x + y * y
+        sigma2 = (radius * 0.6) ** 2
+        kernel = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
+        m = kernel.max()
+        if m > 0:
+            kernel /= m
+
+        self._kernel_cache[radius] = kernel
+        return kernel
+
+    # --------- public API ---------
+    def update(self, detections, frame_width: int, frame_height: int):
+        """
+        Update heatmap with new detections (Ultralytics Boxes object).
+        """
+        if not self.enabled:
+            return
+
+        self._ensure_size(frame_width, frame_height)
+        cv2.multiply(self.heatmap, self.decay_rate, dst=self.heatmap)
+
+        if detections is None or len(detections) == 0:
+            return
+
+        try:
+            boxes_xyxy = detections.xyxy
+            scores = detections.conf
+        except AttributeError:
+            return
+
+        try:
+            boxes_xyxy = boxes_xyxy.detach()
+            scores = scores.detach()
+        except AttributeError:
+            pass
+
+        if hasattr(boxes_xyxy, "is_cuda") and boxes_xyxy.is_cuda:
+            boxes_xyxy = boxes_xyxy.cpu()
+            scores = scores.cpu()
+
+        boxes = boxes_xyxy.numpy()
+        scores = scores.numpy().reshape(-1)
+
+        H, W = self.heatmap.shape
+        sx = W / float(frame_width)
+        sy = H / float(frame_height)
+
+        for (x1, y1, x2, y2), score in zip(boxes, scores):
+            if score <= 0:
+                continue
+
+            cx = int(((x1 + x2) * 0.5) * sx)
+            cy = int(((y1 + y2) * 0.5) * sy)
+            bw = int((x2 - x1) * sx)
+            bh = int((y2 - y1) * sy)
+            radius = max(int(self.radius_scale * max(bw, bh)), 3)
+
+            cx = max(0, min(W - 1, cx))
+            cy = max(0, min(H - 1, cy))
+
+            kernel = self._get_kernel(radius)
+            x0 = cx - radius
+            y0 = cy - radius
+            x1_h = cx + radius + 1
+            y1_h = cy + radius + 1
+
+            x0_clip = max(0, x0)
+            y0_clip = max(0, y0)
+            x1_clip = min(W, x1_h)
+            y1_clip = min(H, y1_h)
+
+            if x0_clip >= x1_clip or y0_clip >= y1_clip:
+                continue
+
+            kx0 = x0_clip - x0
+            ky0 = y0_clip - y0
+            kx1 = kx0 + (x1_clip - x0_clip)
+            ky1 = ky0 + (y1_clip - y0_clip)
+
+            roi = self.heatmap[y0_clip:y1_clip, x0_clip:x1_clip]
+            roi += kernel[ky0:ky1, kx0:kx1] * float(score) * self.intensity_gain
+
+        self.heatmap[self.heatmap < 1e-4] = 0.0
+
+    def get_heatmap_overlay(self, alpha: float = 0.6, colormap: Optional[int] = None):
+        """Return BGR heatmap overlay image or None if empty."""
+        if not self.enabled:
+            return None
+
+        max_val = float(self.heatmap.max())
+        if max_val < 1e-6:
+            return None
+
+        heatmap_norm = (self.heatmap / max_val * 255.0).astype(np.uint8)
+        cmap = self.colormap if colormap is None else colormap
+        heatmap_colored = cv2.applyColorMap(heatmap_norm, cmap)
+
+        if alpha < 1.0:
+            heatmap_colored = cv2.convertScaleAbs(heatmap_colored, alpha=alpha)
+
+        return heatmap_colored
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = bool(enabled)
+        if not enabled:
+            self.clear()
+
+    def set_decay_rate(self, value: float):
+        self.decay_rate = float(np.clip(value, 0.1, 0.99))
+
+    def set_intensity_gain(self, value: float):
+        self.intensity_gain = float(max(0.01, value))
+
+    def set_radius_scale(self, value: float):
+        self.radius_scale = float(max(0.05, value))
+
+    def set_colormap(self, code: int):
+        self.colormap = code
+
+    def clear(self):
+        self.heatmap.fill(0.0)
+
+    def resize(self, new_width: int, new_height: int):
+        new_width = int(max(1, new_width))
+        new_height = int(max(1, new_height))
+        self.width = new_width
+        self.height = new_height
+        self.heatmap = np.zeros((new_height, new_width), dtype=np.float32)
+        self._kernel_cache.clear()
+
+
 class BehaviorAnalysisThread:
     """Background worker that runs BehaviorAnalyzer off the UI thread."""
 
@@ -1343,7 +1523,6 @@ class YoloTrackerWindow(QMainWindow):
         """Initialize heatmap buffers and defaults"""
         self.heatmap_width = 480
         self.heatmap_height = 240
-        self.heatmap_accum = np.zeros((self.heatmap_height, self.heatmap_width), dtype=np.float32)
         self.heatmap_enabled = True
         self.heatmap_decay = 0.92
         self.heatmap_intensity = 1.5
@@ -1352,6 +1531,16 @@ class YoloTrackerWindow(QMainWindow):
         default_colormap = self.colormap_options[0][1] if self.colormap_options else cv2.COLORMAP_JET
         self.heatmap_colormap = default_colormap
         self.heatmap_label = None
+        self.heatmap_radius_scale = max(0.05, self.heatmap_radius / 24.0)
+        self.heatmap_manager = HeatmapManager(
+            width=self.heatmap_width,
+            height=self.heatmap_height,
+            decay_rate=self.heatmap_decay
+        )
+        self.heatmap_manager.set_enabled(self.heatmap_enabled)
+        self.heatmap_manager.set_intensity_gain(self.heatmap_intensity)
+        self.heatmap_manager.set_radius_scale(self.heatmap_radius_scale)
+        self.heatmap_manager.set_colormap(self.heatmap_colormap)
 
     def _build_colormap_options(self):
         preferred = ["INFERNO", "PLASMA", "MAGMA", "TURBO", "JET", "HOT"]
@@ -1438,6 +1627,7 @@ class YoloTrackerWindow(QMainWindow):
 
     def on_heatmap_enabled_toggled(self, checked):
         self.heatmap_enabled = checked
+        self.heatmap_manager.set_enabled(checked)
         if not checked and self.heatmap_label is not None:
             self.heatmap_label.setPixmap(QPixmap())
             self.heatmap_label.setText("Heatmap disabled")
@@ -1446,57 +1636,41 @@ class YoloTrackerWindow(QMainWindow):
 
     def on_heatmap_decay_changed(self, value):
         self.heatmap_decay = float(value)
+        self.heatmap_manager.set_decay_rate(self.heatmap_decay)
 
     def on_heatmap_intensity_changed(self, value):
         self.heatmap_intensity = float(value)
+        self.heatmap_manager.set_intensity_gain(self.heatmap_intensity)
 
     def on_heatmap_radius_changed(self, value):
         self.heatmap_radius = int(value)
+        self.heatmap_radius_scale = max(0.05, self.heatmap_radius / 24.0)
+        self.heatmap_manager.set_radius_scale(self.heatmap_radius_scale)
 
     def on_heatmap_colormap_changed(self, name):
         for option_name, option_value in self.colormap_options:
             if option_name == name:
                 self.heatmap_colormap = option_value
                 break
+        self.heatmap_manager.set_colormap(self.heatmap_colormap)
         self.render_heatmap()
 
     def reset_heatmap(self):
-        self.heatmap_accum = np.zeros((self.heatmap_height, self.heatmap_width), dtype=np.float32)
+        self.heatmap_manager.clear()
         if self.heatmap_label is not None:
             self.render_heatmap()
 
     def update_heatmap(self, res):
-        if not self.heatmap_enabled or self.heatmap_accum is None:
+        if not self.heatmap_enabled or self.heatmap_manager is None:
             return
 
-        self.heatmap_accum *= self.heatmap_decay
-
-        boxes = getattr(res, "boxes", None)
-        if boxes is not None and boxes.xyxy is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy
-            if hasattr(xyxy, "detach"):
-                xyxy = xyxy.detach().cpu().numpy()
-            else:
-                xyxy = np.asarray(xyxy)
-
-            orig_shape = getattr(res, "orig_shape", None)
-            if orig_shape is None and hasattr(boxes, "orig_shape"):
-                orig_shape = boxes.orig_shape
-            if orig_shape is None:
-                orig_h, orig_w = self.heatmap_height, self.heatmap_width
-            else:
-                orig_h, orig_w = orig_shape[:2]
-
-            scale_x = self.heatmap_width / max(orig_w, 1)
-            scale_y = self.heatmap_height / max(orig_h, 1)
-
-            for x1, y1, x2, y2 in xyxy:
-                cx = (x1 + x2) * 0.5
-                cy = (y1 + y2) * 0.5
-                u = int(np.clip(cx * scale_x, 0, self.heatmap_width - 1))
-                v = int(np.clip(cy * scale_y, 0, self.heatmap_height - 1))
-                cv2.circle(self.heatmap_accum, (u, v), self.heatmap_radius, self.heatmap_intensity, -1)
-
+        frame = getattr(res, "orig_img", None)
+        if frame is None:
+            frame = res.plot()
+        if frame is None:
+            return
+        h, w = frame.shape[:2]
+        self.heatmap_manager.update(getattr(res, "boxes", None), w, h)
         self.render_heatmap()
 
     def render_heatmap(self):
@@ -1508,21 +1682,13 @@ class YoloTrackerWindow(QMainWindow):
             self.heatmap_label.setText("Heatmap disabled")
             return
 
-        if self.heatmap_accum is None:
-            self.reset_heatmap()
+        overlay = self.heatmap_manager.get_heatmap_overlay(colormap=self.heatmap_colormap)
+        if overlay is None:
+            self.heatmap_label.setPixmap(QPixmap())
+            self.heatmap_label.setText("Heatmap cooling...")
             return
 
-        heatmap_data = self.heatmap_accum.copy()
-        if heatmap_data.size == 0:
-            return
-
-        if np.max(heatmap_data) > 0:
-            normalized = cv2.normalize(heatmap_data, None, 0, 255, cv2.NORM_MINMAX)
-        else:
-            normalized = heatmap_data
-        normalized = normalized.astype(np.uint8)
-        colored = cv2.applyColorMap(normalized, self.heatmap_colormap)
-        colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+        colored = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
 
         h, w, ch = colored.shape
         q_img = QImage(colored.data, w, h, w * ch, QImage.Format.Format_RGB888)
